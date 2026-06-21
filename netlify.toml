@@ -1,0 +1,21 @@
+# Netlify 部署配置
+[build]
+  publish = "public"              # 前端静态资源目录
+  functions = "netlify/functions" # 函数目录
+
+[functions]
+  node_bundler = "esbuild"
+  # @netlify/blobs 用动态 import 引入，确保被打进函数包
+  external_node_modules = ["@netlify/blobs"]
+
+# 所有 /api/* 交给 Express 函数处理
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+
+# 其余路径回退到单页应用（已存在的静态文件会被优先直接返回）
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

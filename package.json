@@ -1,0 +1,21 @@
+{
+  "name": "family-asset",
+  "version": "2.0.0",
+  "description": "家庭资产管理平台 - 移动端优先的家庭物资库存共享应用（支持 Netlify 部署）",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^8.1.0",
+    "bcryptjs": "^2.4.3",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "serverless-http": "^3.2.0"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "家庭资产管理",
+  "short_name": "家庭资产",
+  "description": "管理家庭物资库存，随时知道家里还剩多少",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f9d8a",
+  "theme_color": "#0f9d8a",
+  "orientation": "portrait",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
