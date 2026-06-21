@@ -162,11 +162,11 @@ function navBar() {
     family: '<circle cx="9" cy="8" r="3"/><path d="M3 20c0-3 3-5 6-5s6 2 6 5"/><circle cx="17" cy="9" r="2.2"/><path d="M16 20c0-2 1-3.5 3-4"/>',
     me: '<circle cx="12" cy="8" r="3.5"/><path d="M5 20c0-4 3-6 7-6s7 2 7 6"/>',
   };
-  const n = (t, label) => `<div class="nav-item ${State.tab===t?'active':''}" data-tab="${t}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${ic[t]}</svg><span>${label}</span></div>`;
   const alertCount = State.items.filter(needRestock).length + State.items.filter(expiringSoon).length;
+  const n = (t, label, badge) => `<div class="nav-item ${State.tab===t?'active':''}" data-tab="${t}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${ic[t]}</svg><span>${label}</span>${badge?`<span class="nav-badge">${badge>99?'99+':badge}</span>`:''}</div>`;
   return `<nav class="bottom-nav">
     ${n('items','资产')}
-    <div style="position:relative">${n('alerts','提醒')}${alertCount?`<span style="position:absolute;top:6px;right:18px;min-width:16px;height:16px;background:var(--danger);color:#fff;border-radius:8px;font-size:10px;display:flex;align-items:center;justify-content:center;padding:0 4px;font-weight:700">${alertCount}</span>`:''}</div>
+    ${n('alerts','提醒', alertCount)}
     <div class="nav-fab"><button id="fab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button></div>
     ${n('family','家庭')}
     ${n('me','我的')}
@@ -264,6 +264,10 @@ function itemCard(it) {
   const metas = [];
   if (it.location) metas.push(`<span class="tag">📍${esc(it.location)}</span>`);
   if (it.expiry) metas.push(`<span class="tag">📅${esc(it.expiry)}</span>`);
+  if (it.autoConsume > 0 && it.consumePeriod) {
+    const pl = { day: '每天', week: '每周', month: '每月' }[it.consumePeriod] || '';
+    metas.push(`<span class="tag" style="color:var(--primary)">⏱${pl}-${it.autoConsume}${esc(it.unit)}</span>`);
+  }
   metas.push(`<span class="tag" style="color:var(--text-faint)">${esc(it.updatedByName)}更新</span>`);
   return `
   <div class="item" data-edit="${it.id}">
@@ -466,6 +470,18 @@ function openItemModal(itemId) {
       <div class="field"><label>补货阈值</label><input id="i_thr" type="number" inputmode="decimal" value="${it?it.threshold:0}" placeholder="低于则提醒" /></div>
     </div>
     <div class="field"><label>保质期 / 到期日（可选）</label><input id="i_exp" type="date" value="${esc(it?.expiry)}" /></div>
+    <div class="field"><label>自动消耗（可选，按周期自动扣减库存）</label>
+      <div class="row2">
+        <input id="i_auto" type="number" inputmode="decimal" min="0" value="${it&&it.autoConsume?it.autoConsume:0}" placeholder="每周期消耗量" />
+        <select id="i_period">
+          <option value="" ${!it||!it.consumePeriod?'selected':''}>不自动</option>
+          <option value="day" ${it&&it.consumePeriod==='day'?'selected':''}>每天</option>
+          <option value="week" ${it&&it.consumePeriod==='week'?'selected':''}>每周</option>
+          <option value="month" ${it&&it.consumePeriod==='month'?'selected':''}>每月</option>
+        </select>
+      </div>
+      <div class="hint">例：厕纸填「1」+「每周」，每过一周自动减 1。需补货时仍会提醒。</div>
+    </div>
     <div class="field"><label>备注（可选）</label><textarea id="i_note" placeholder="品牌、规格、购买渠道等">${esc(it?.note)}</textarea></div>
     <div class="btn-row">
       ${it ? '<button class="btn btn-danger" id="del" style="flex:0 0 90px">删除</button>' : ''}
@@ -482,6 +498,8 @@ function openItemModal(itemId) {
         threshold: $('#i_thr').value,
         expiry: $('#i_exp').value,
         note: $('#i_note').value.trim(),
+        autoConsume: $('#i_auto').value,
+        consumePeriod: $('#i_period').value,
       };
       if (!body.name) return toast('请填写物品名称', true);
       try {
