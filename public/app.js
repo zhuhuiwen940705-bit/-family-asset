@@ -196,10 +196,13 @@ function renderItems(s) {
     <div class="topbar">
       <h2>🏠 ${esc(State.family.name)}</h2>
       <div class="sub">共 ${total} 件物品 · ${low?`<span style="color:var(--warn)">${low} 件需补货</span>`:'库存充足'}</div>
-      <div class="search-bar">
-        <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
-        <input id="search" placeholder="搜索物品名、位置、备注…" value="${esc(State.search)}" />
-        ${State.search?'<button class="clear" id="clearS">×</button>':''}
+      <div class="search-row">
+        <div class="search-bar">
+          <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+          <input id="search" placeholder="搜索物品名、位置、备注…" value="${esc(State.search)}" />
+          ${State.search?'<button class="clear" id="clearS">×</button>':''}
+        </div>
+        <button class="mic-btn" id="micBtn" title="语音录入"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
       </div>
     </div>
     <div class="stats">
@@ -216,6 +219,7 @@ function renderItems(s) {
   const search = $('#search');
   search.oninput = () => { State.search = search.value; drawItemList(); };
   const cs = $('#clearS'); if (cs) cs.onclick = () => { State.search = ''; renderItems(s); };
+  const mic = $('#micBtn'); if (mic) mic.onclick = startVoice;
   s.querySelectorAll('[data-cat]').forEach((c) =>
     c.onclick = () => { State.filterCat = c.dataset.cat; renderItems(s); });
   drawItemList();
@@ -556,6 +560,174 @@ function copyText(text, msg) {
     const t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select();
     try { document.execCommand('copy'); toast(msg || '已复制'); } catch { toast('复制失败', true); }
     t.remove();
+  });
+}
+
+// ---------- 语音录入（浏览器语音识别 + 本地规则解析）----------
+const VOICE = {
+  SUB: ['用掉', '用了', '用过', '用完', '消耗', '少了', '喝了', '喝掉', '吃了', '吃掉', '没了', '拿走', '拿了', '取走', '取出', '扣掉', '扣', '减少', '减'],
+  ADD: ['买了', '买回', '买', '购入', '采购', '添加', '新增', '加了', '增加', '补了', '补货', '补', '进了', '多了', '囤了', '囤', '存了'],
+  SET: ['还剩', '剩下', '只剩', '剩', '现在有', '现有', '还有', '设为', '设成', '改成', '变成', '现在是', '总共'],
+};
+
+function parseChineseNumber(s) {
+  if (!s) return null;
+  const ar = s.match(/\d+(?:\.\d+)?/);
+  if (ar) return parseFloat(ar[0]);
+  const map = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 俩: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10, 百: 100 };
+  const m = s.match(/[零〇一二两俩三四五六七八九十百]+半?|半/);
+  if (!m) return null;
+  let str = m[0], half = 0;
+  if (str.endsWith('半')) { half = 0.5; str = str.slice(0, -1); }
+  if (str === '') return half || null;
+  let section = 0, num = 0;
+  for (const ch of str) {
+    const v = map[ch];
+    if (v === undefined) continue;
+    if (v === 10 || v === 100) { section += (num === 0 ? 1 : num) * v; num = 0; }
+    else num = v;
+  }
+  const total = section + num + half;
+  return total || null;
+}
+
+function matchVoiceItem(seg, items) {
+  let best = null, bestLen = 0;
+  for (const it of items) if (it.name && seg.includes(it.name) && it.name.length > bestLen) { best = it; bestLen = it.name.length; }
+  if (best) return best;
+  // 模糊匹配（容忍识别误差）：按字符重合度，阈值偏高避免"抽纸/厕纸"这类单字误匹配
+  let bestScore = 0;
+  for (const it of items) {
+    const chars = [...new Set((it.name || '').split(''))];
+    if (!chars.length) continue;
+    const hit = chars.filter((c) => seg.includes(c)).length;
+    const score = hit / chars.length;
+    if (score > bestScore && score >= 0.67) { bestScore = score; best = it; }
+  }
+  return best;
+}
+
+function detectAction(seg) {
+  for (const k of VOICE.SET) if (seg.includes(k)) return 'set';
+  for (const k of VOICE.SUB) if (seg.includes(k)) return 'sub';
+  for (const k of VOICE.ADD) if (seg.includes(k)) return 'add';
+  return 'set'; // 没有动作词时默认理解为"设为"（用户确认前可取消）
+}
+
+function parseVoiceCommand(text, items) {
+  const segs = text.split(/[，,。；;、\s]+|还有|然后|再有|再/).map((x) => x.trim()).filter(Boolean);
+  const EMPTY = ['没了', '没有了', '用完', '用光', '光了', '空了', '喝完', '吃完', '清空'];
+  const ops = [];
+  for (const seg of segs) {
+    let qty = parseChineseNumber(seg);
+    const isEmpty = qty === null && EMPTY.some((w) => seg.includes(w));
+    if (isEmpty) qty = 0;
+    const item = matchVoiceItem(seg, items);
+    if (qty === null || !item) continue;
+    const action = isEmpty ? 'set' : detectAction(seg);
+    const before = item.quantity;
+    let after;
+    if (action === 'add') after = before + qty;
+    else if (action === 'sub') after = Math.max(0, before - qty);
+    else after = qty;
+    ops.push({ itemId: item.id, name: item.name, unit: item.unit, action, qty, before, after });
+  }
+  return ops;
+}
+
+let _recognition = null, _voiceCancelled = false;
+function startVoice() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { toast('此浏览器不支持语音，请用 Chrome 打开', true); return; }
+  _voiceCancelled = false;
+  let finalText = '';
+  const rec = _recognition = new SR();
+  rec.lang = 'zh-CN'; rec.interimResults = true; rec.maxAlternatives = 1; rec.continuous = false;
+  showListening();
+  rec.onresult = (e) => {
+    let interim = '';
+    finalText = '';
+    for (let i = 0; i < e.results.length; i++) {
+      const t = e.results[i][0].transcript;
+      if (e.results[i].isFinal) finalText += t; else interim += t;
+    }
+    updateListening((finalText + interim) || '…');
+  };
+  rec.onerror = (e) => {
+    _voiceCancelled = true; closeModal();
+    toast(e.error === 'not-allowed' || e.error === 'service-not-allowed' ? '请允许麦克风权限后重试' : '语音识别失败，请重试', true);
+  };
+  rec.onend = () => {
+    if (_voiceCancelled) return;
+    const txt = finalText.trim();
+    if (!txt) { closeModal(); toast('没听清，请再说一次', true); return; }
+    handleVoiceResult(txt);
+  };
+  try { rec.start(); } catch { /* already started */ }
+}
+
+function showListening() {
+  openModal(`
+    <h3>🎤 正在聆听…</h3>
+    <div class="voice-listen"><div class="voice-wave"><span></span><span></span><span></span><span></span><span></span></div></div>
+    <div class="voice-heard" id="voiceHeard">请说，例如「厕纸用掉一包」「买了两瓶酱油」「牛奶还剩三盒」</div>
+    <div class="btn-row">
+      <button class="btn btn-ghost" id="vCancel">取消</button>
+      <button class="btn" id="vStop">说完了</button>
+    </div>`, () => {
+    $('#vCancel').onclick = () => { _voiceCancelled = true; try { _recognition && _recognition.abort(); } catch {} closeModal(); };
+    $('#vStop').onclick = () => { try { _recognition && _recognition.stop(); } catch {} };
+  });
+}
+function updateListening(text) { const el = $('#voiceHeard'); if (el) { el.textContent = text; el.classList.add('active'); } }
+
+function actionLabel(a) { return a === 'add' ? '增加' : a === 'sub' ? '减少' : '设为'; }
+
+function handleVoiceResult(transcript) {
+  const ops = parseVoiceCommand(transcript, State.items);
+  if (!ops.length) {
+    openModal(`
+      <h3>🎤 没太听懂</h3>
+      <div class="voice-transcript">“${esc(transcript)}”</div>
+      <p style="color:var(--text-soft);font-size:13.5px">没能从中识别出"物品 + 数量"。请确认物品名和应用里一致，换个说法再试，例如「厕纸 用掉 一包」。</p>
+      <div class="btn-row"><button class="btn btn-ghost" id="vClose">关闭</button><button class="btn" id="vRetry">再说一次</button></div>
+    `, () => { $('#vClose').onclick = closeModal; $('#vRetry').onclick = startVoice; });
+    return;
+  }
+  const rows = ops.map((o, i) => `
+    <label class="voice-op">
+      <input type="checkbox" data-i="${i}" checked />
+      <div class="voice-op-main">
+        <div class="voice-op-name">${esc(o.name)} <span class="voice-op-act ${o.action}">${actionLabel(o.action)} ${o.qty}${esc(o.unit)}</span></div>
+        <div class="voice-op-num">${o.before}${esc(o.unit)} → <b>${o.after}${esc(o.unit)}</b></div>
+      </div>
+    </label>`).join('');
+  openModal(`
+    <h3>🎤 听到的内容</h3>
+    <div class="voice-transcript">“${esc(transcript)}”</div>
+    <div class="voice-tip">请核对，确认无误再写入：</div>
+    ${rows}
+    <div class="btn-row"><button class="btn btn-ghost" id="vRetry">重说</button><button class="btn" id="vApply">确认写入</button></div>
+  `, () => {
+    $('#vRetry').onclick = startVoice;
+    $('#vApply').onclick = async () => {
+      const picked = [...document.querySelectorAll('.voice-op input:checked')].map((c) => ops[Number(c.dataset.i)]);
+      if (!picked.length) return toast('请至少勾选一项', true);
+      const btn = $('#vApply'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+      let okCount = 0;
+      for (const o of picked) {
+        try {
+          let r;
+          if (o.action === 'set') r = await API.put(`/items/${o.itemId}`, { quantity: o.after });
+          else r = await API.post(`/items/${o.itemId}/adjust`, { delta: o.action === 'add' ? o.qty : -o.qty });
+          const local = State.items.find((x) => x.id === o.itemId);
+          if (local) Object.assign(local, r.item);
+          okCount++;
+        } catch (e) { toast(o.name + '：' + e.message, true); }
+      }
+      closeModal();
+      if (okCount) { toast(`已更新 ${okCount} 项`); renderMain(); }
+    };
   });
 }
 
