@@ -635,51 +635,86 @@ function parseVoiceCommand(text, items) {
   return ops;
 }
 
-let _recognition = null, _voiceCancelled = false;
-function startVoice() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) { toast('此浏览器不支持语音，请用 Chrome 打开', true); return; }
+// 录音 → 转 16k 单声道 wav → 发后端（百度语音）转文字。国内可用，不依赖浏览器自带识别。
+let _mediaRecorder = null, _audioStream = null, _voiceCancelled = false;
+async function startVoice() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
+    toast('此浏览器不支持录音，请用 Chrome 打开', true); return;
+  }
   _voiceCancelled = false;
-  let finalText = '';
-  const rec = _recognition = new SR();
-  rec.lang = 'zh-CN'; rec.interimResults = true; rec.maxAlternatives = 1; rec.continuous = false;
-  showListening();
-  rec.onresult = (e) => {
-    let interim = '';
-    finalText = '';
-    for (let i = 0; i < e.results.length; i++) {
-      const t = e.results[i][0].transcript;
-      if (e.results[i].isFinal) finalText += t; else interim += t;
-    }
-    updateListening((finalText + interim) || '…');
-  };
-  rec.onerror = (e) => {
-    _voiceCancelled = true; closeModal();
-    toast(e.error === 'not-allowed' || e.error === 'service-not-allowed' ? '请允许麦克风权限后重试' : '语音识别失败，请重试', true);
-  };
-  rec.onend = () => {
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch { toast('请允许麦克风权限后重试', true); return; }
+  _audioStream = stream;
+  const chunks = [];
+  const mr = _mediaRecorder = new MediaRecorder(stream);
+  mr.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  mr.onstop = async () => {
+    stream.getTracks().forEach((t) => t.stop());
     if (_voiceCancelled) return;
-    const txt = finalText.trim();
-    if (!txt) { closeModal(); toast('没听清，请再说一次', true); return; }
-    handleVoiceResult(txt);
+    showVoiceProcessing();
+    try {
+      const blob = new Blob(chunks, { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
+      if (!blob.size) { closeModal(); toast('没录到声音，请再试一次', true); return; }
+      const wavB64 = await blobToWav16kBase64(blob);
+      const r = await API.post('/voice', { audio: wavB64, format: 'wav', rate: 16000 });
+      if (_voiceCancelled) return;
+      const txt = (r.text || '').trim();
+      if (!txt) { closeModal(); toast('没听清，请再说一次', true); return; }
+      handleVoiceResult(txt);
+    } catch (e) { closeModal(); toast(e.message || '识别失败，请重试', true); }
   };
-  try { rec.start(); } catch { /* already started */ }
+  showRecording();
+  mr.start();
 }
 
-function showListening() {
+function showRecording() {
   openModal(`
-    <h3>🎤 正在聆听…</h3>
+    <h3>🎤 正在录音…</h3>
     <div class="voice-listen"><div class="voice-wave"><span></span><span></span><span></span><span></span><span></span></div></div>
-    <div class="voice-heard" id="voiceHeard">请说，例如「厕纸用掉一包」「买了两瓶酱油」「牛奶还剩三盒」</div>
+    <div class="voice-heard">说出物品和数量，例如「厕纸用掉一包」「买了两瓶酱油」「牛奶还剩三盒」<br>说完点下面「说完了」</div>
     <div class="btn-row">
       <button class="btn btn-ghost" id="vCancel">取消</button>
       <button class="btn" id="vStop">说完了</button>
     </div>`, () => {
-    $('#vCancel').onclick = () => { _voiceCancelled = true; try { _recognition && _recognition.abort(); } catch {} closeModal(); };
-    $('#vStop').onclick = () => { try { _recognition && _recognition.stop(); } catch {} };
+    $('#vCancel').onclick = () => { _voiceCancelled = true; try { _mediaRecorder && _mediaRecorder.state !== 'inactive' && _mediaRecorder.stop(); } catch {} if (_audioStream) _audioStream.getTracks().forEach((t) => t.stop()); closeModal(); };
+    $('#vStop').onclick = () => { try { _mediaRecorder && _mediaRecorder.state !== 'inactive' && _mediaRecorder.stop(); } catch {} };
   });
 }
-function updateListening(text) { const el = $('#voiceHeard'); if (el) { el.textContent = text; el.classList.add('active'); } }
+function showVoiceProcessing() {
+  openModal(`<h3>🎤 识别中…</h3><div class="center-load"><span class="spinner"></span></div><div class="voice-heard">正在把语音转成文字</div>`);
+}
+
+// webm/opus 录音 → 解码 → 重采样到 16k 单声道 → 编码为 wav → base64
+async function blobToWav16kBase64(blob) {
+  const buf = await blob.arrayBuffer();
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx();
+  const audioBuf = await ctx.decodeAudioData(buf);
+  try { ctx.close(); } catch {}
+  const input = audioBuf.getChannelData(0);
+  const ratio = audioBuf.sampleRate / 16000;
+  const outLen = Math.max(1, Math.floor(input.length / ratio));
+  const out = new Int16Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const idx = i * ratio, i0 = Math.floor(idx), i1 = Math.min(i0 + 1, input.length - 1);
+    let s = input[i0] * (1 - (idx - i0)) + input[i1] * (idx - i0);
+    s = Math.max(-1, Math.min(1, s));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  const ab = new ArrayBuffer(44 + out.length * 2);
+  const v = new DataView(ab);
+  const ws = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + out.length * 2, true); ws(8, 'WAVE');
+  ws(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  ws(36, 'data'); v.setUint32(40, out.length * 2, true);
+  for (let i = 0; i < out.length; i++) v.setInt16(44 + i * 2, out[i], true);
+  const bytes = new Uint8Array(ab);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
 
 function actionLabel(a) { return a === 'add' ? '增加' : a === 'sub' ? '减少' : '设为'; }
 
