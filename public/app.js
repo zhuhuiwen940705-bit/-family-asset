@@ -661,12 +661,16 @@ async function startVoice() {
       if (_voiceCancelled) return;
       const txt = (r.text || '').trim();
       if (!txt) { closeModal(); toast('没听清，请再说一次', true); return; }
-      // 后端配了 DeepSeek 时返回已解析好的 ops（更智能）；否则回退本地规则解析
-      if (Array.isArray(r.ops)) {
-        if (r.ops.length) showVoiceConfirm(txt, r.ops);
-        else showVoiceNotUnderstood(txt);
+      // 第二步：单独调大模型理解（先秒显已识别文字，理解在后台跑，不拖垮识别）
+      showVoiceUnderstanding(txt);
+      let ops = null;
+      try { const p = await API.post('/parse', { text: txt }); ops = p.ops; } catch { ops = null; }
+      if (_voiceCancelled) return;
+      if (Array.isArray(ops)) {
+        if (ops.length) showVoiceConfirm(txt, ops);
+        else { const loc = parseVoiceCommand(txt, State.items); loc.length ? showVoiceConfirm(txt, loc) : showVoiceNotUnderstood(txt); }
       } else {
-        handleVoiceResult(txt);
+        handleVoiceResult(txt); // 大模型不可用 → 本地规则兜底
       }
     } catch (e) { closeModal(); toast(e.message || '识别失败，请重试', true); }
   };
@@ -689,6 +693,9 @@ function showRecording() {
 }
 function showVoiceProcessing() {
   openModal(`<h3>🎤 识别中…</h3><div class="center-load"><span class="spinner"></span></div><div class="voice-heard">正在把语音转成文字</div>`);
+}
+function showVoiceUnderstanding(text) {
+  openModal(`<h3>🎤 听到的内容</h3><div class="voice-transcript">“${esc(text)}”</div><div class="center-load"><span class="spinner"></span></div><div class="voice-heard">正在理解…</div>`);
 }
 
 // webm/opus 录音 → 解码 → 重采样到 16k 单声道 → 编码为 wav → base64
