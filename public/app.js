@@ -661,7 +661,13 @@ async function startVoice() {
       if (_voiceCancelled) return;
       const txt = (r.text || '').trim();
       if (!txt) { closeModal(); toast('没听清，请再说一次', true); return; }
-      handleVoiceResult(txt);
+      // 后端配了 DeepSeek 时返回已解析好的 ops（更智能）；否则回退本地规则解析
+      if (Array.isArray(r.ops)) {
+        if (r.ops.length) showVoiceConfirm(txt, r.ops);
+        else showVoiceNotUnderstood(txt);
+      } else {
+        handleVoiceResult(txt);
+      }
     } catch (e) { closeModal(); toast(e.message || '识别失败，请重试', true); }
   };
   showRecording();
@@ -718,17 +724,23 @@ async function blobToWav16kBase64(blob) {
 
 function actionLabel(a) { return a === 'add' ? '增加' : a === 'sub' ? '减少' : '设为'; }
 
+// 本地规则解析（DeepSeek 未配置/出错时的兜底）
 function handleVoiceResult(transcript) {
   const ops = parseVoiceCommand(transcript, State.items);
-  if (!ops.length) {
-    openModal(`
-      <h3>🎤 没太听懂</h3>
-      <div class="voice-transcript">“${esc(transcript)}”</div>
-      <p style="color:var(--text-soft);font-size:13.5px">没能从中识别出"物品 + 数量"。请确认物品名和应用里一致，换个说法再试，例如「厕纸 用掉 一包」。</p>
-      <div class="btn-row"><button class="btn btn-ghost" id="vClose">关闭</button><button class="btn" id="vRetry">再说一次</button></div>
-    `, () => { $('#vClose').onclick = closeModal; $('#vRetry').onclick = startVoice; });
-    return;
-  }
+  if (!ops.length) return showVoiceNotUnderstood(transcript);
+  showVoiceConfirm(transcript, ops);
+}
+
+function showVoiceNotUnderstood(transcript) {
+  openModal(`
+    <h3>🎤 没太听懂</h3>
+    <div class="voice-transcript">“${esc(transcript)}”</div>
+    <p style="color:var(--text-soft);font-size:13.5px">没能识别出要改哪样物品、改多少。请确认物品名和应用里一致，换个说法再试，例如「厕纸 用掉 一包」。</p>
+    <div class="btn-row"><button class="btn btn-ghost" id="vClose">关闭</button><button class="btn" id="vRetry">再说一次</button></div>
+  `, () => { $('#vClose').onclick = closeModal; $('#vRetry').onclick = startVoice; });
+}
+
+function showVoiceConfirm(transcript, ops) {
   const rows = ops.map((o, i) => `
     <label class="voice-op">
       <input type="checkbox" data-i="${i}" checked />
