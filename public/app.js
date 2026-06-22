@@ -635,47 +635,81 @@ function parseVoiceCommand(text, items) {
   return ops;
 }
 
-// 录音 → 转 16k 单声道 wav → 发后端（百度语音）转文字。国内可用，不依赖浏览器自带识别。
-let _mediaRecorder = null, _audioStream = null, _voiceCancelled = false;
+// 浏览器直连讯飞 WebSocket 流式识别：音频从手机直发讯飞（国内 1~2 秒出字），
+// 不经 Netlify；Netlify 只负责签名地址。识别完再调 /api/parse 做 DeepSeek 理解。
+let _voiceCancelled = false, _iat = null;
 async function startVoice() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !AC || !window.WebSocket) {
     toast('此浏览器不支持录音，请用 Chrome 打开', true); return;
   }
   _voiceCancelled = false;
+  let info;
+  try { info = await API.get('/iflytek-url'); }
+  catch (e) { toast(e.message || '获取语音授权失败', true); return; }
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch { toast('请允许麦克风权限后重试', true); return; }
-  _audioStream = stream;
-  const chunks = [];
-  const mr = _mediaRecorder = new MediaRecorder(stream);
-  mr.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-  mr.onstop = async () => {
-    stream.getTracks().forEach((t) => t.stop());
-    if (_voiceCancelled) return;
-    showVoiceProcessing();
-    try {
-      const blob = new Blob(chunks, { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
-      if (!blob.size) { closeModal(); toast('没录到声音，请再试一次', true); return; }
-      const wavB64 = await blobToWav16kBase64(blob);
-      const r = await API.post('/voice', { audio: wavB64, format: 'wav', rate: 16000 });
-      if (_voiceCancelled) return;
-      const txt = (r.text || '').trim();
-      if (!txt) { closeModal(); toast('没听清，请再说一次', true); return; }
-      // 第二步：单独调大模型理解（先秒显已识别文字，理解在后台跑，不拖垮识别）
-      showVoiceUnderstanding(txt);
-      let ops = null;
-      try { const p = await API.post('/parse', { text: txt }); ops = p.ops; } catch { ops = null; }
-      if (_voiceCancelled) return;
-      if (Array.isArray(ops)) {
-        if (ops.length) showVoiceConfirm(txt, ops);
-        else { const loc = parseVoiceCommand(txt, State.items); loc.length ? showVoiceConfirm(txt, loc) : showVoiceNotUnderstood(txt); }
-      } else {
-        handleVoiceResult(txt); // 大模型不可用 → 本地规则兜底
-      }
-    } catch (e) { closeModal(); toast(e.message || '识别失败，请重试', true); }
-  };
+
   showRecording();
-  mr.start();
+  const ctx = new AC();
+  const source = ctx.createMediaStreamSource(stream);
+  const proc = ctx.createScriptProcessor(2048, 1, 1);
+  const ws = new WebSocket(info.url);
+  let firstFrame = true, fullText = '', ended = false;
+
+  const cleanup = () => {
+    try { proc.disconnect(); } catch {}
+    try { source.disconnect(); } catch {}
+    try { ctx.close(); } catch {}
+    try { stream.getTracks().forEach((t) => t.stop()); } catch {}
+    _iat = null;
+  };
+  const sendEnd = () => {
+    if (ended) return; ended = true;
+    try { if (ws.readyState === 1) ws.send(JSON.stringify({ data: { status: 2, format: 'audio/L16;rate=16000', encoding: 'raw', audio: '' } })); } catch {}
+    try { proc.disconnect(); source.disconnect(); } catch {}
+  };
+  _iat = { ws, sendEnd, cancel: () => { _voiceCancelled = true; try { ws.close(); } catch {} cleanup(); } };
+
+  ws.onopen = () => { source.connect(proc); proc.connect(ctx.destination); };
+  proc.onaudioprocess = (e) => {
+    if (ws.readyState !== 1 || ended) return;
+    const frame = { data: { status: firstFrame ? 0 : 1, format: 'audio/L16;rate=16000', encoding: 'raw', audio: floatToInt16Base64(e.inputBuffer.getChannelData(0), ctx.sampleRate) } };
+    if (firstFrame) {
+      frame.common = { app_id: info.appId };
+      frame.business = { language: 'zh_cn', domain: 'iat', accent: 'mandarin', vad_eos: 4000 };
+      firstFrame = false;
+    }
+    try { ws.send(JSON.stringify(frame)); } catch {}
+  };
+  ws.onmessage = (ev) => {
+    let r; try { r = JSON.parse(ev.data); } catch { return; }
+    if (r.code !== 0) {
+      cleanup(); try { ws.close(); } catch {}
+      if (!_voiceCancelled) { closeModal(); toast('讯飞识别错误：' + r.code + ' ' + (r.message || ''), true); }
+      return;
+    }
+    if (r.data && r.data.result && r.data.result.ws) {
+      fullText += r.data.result.ws.map((seg) => seg.cw.map((c) => c.w).join('')).join('');
+    }
+    if (r.data && r.data.status === 2) { try { ws.close(); } catch {} }
+  };
+  ws.onerror = () => { if (!_voiceCancelled) { closeModal(); toast('语音连接失败，请重试', true); } cleanup(); };
+  ws.onclose = async () => {
+    cleanup();
+    if (_voiceCancelled) return;
+    const txt = fullText.trim();
+    if (!txt) { closeModal(); toast('没听清，请再说一次', true); return; }
+    showVoiceUnderstanding(txt);
+    let ops = null;
+    try { const p = await API.post('/parse', { text: txt }); ops = p.ops; } catch { ops = null; }
+    if (_voiceCancelled) return;
+    if (Array.isArray(ops)) {
+      if (ops.length) showVoiceConfirm(txt, ops);
+      else { const loc = parseVoiceCommand(txt, State.items); loc.length ? showVoiceConfirm(txt, loc) : showVoiceNotUnderstood(txt); }
+    } else { handleVoiceResult(txt); }
+  };
 }
 
 function showRecording() {
@@ -687,8 +721,8 @@ function showRecording() {
       <button class="btn btn-ghost" id="vCancel">取消</button>
       <button class="btn" id="vStop">说完了</button>
     </div>`, () => {
-    $('#vCancel').onclick = () => { _voiceCancelled = true; try { _mediaRecorder && _mediaRecorder.state !== 'inactive' && _mediaRecorder.stop(); } catch {} if (_audioStream) _audioStream.getTracks().forEach((t) => t.stop()); closeModal(); };
-    $('#vStop').onclick = () => { try { _mediaRecorder && _mediaRecorder.state !== 'inactive' && _mediaRecorder.stop(); } catch {} };
+    $('#vCancel').onclick = () => { if (_iat) _iat.cancel(); else _voiceCancelled = true; closeModal(); };
+    $('#vStop').onclick = () => { if (_iat) { _iat.sendEnd(); showVoiceProcessing(); } };
   });
 }
 function showVoiceProcessing() {
@@ -698,15 +732,9 @@ function showVoiceUnderstanding(text) {
   openModal(`<h3>🎤 听到的内容</h3><div class="voice-transcript">“${esc(text)}”</div><div class="center-load"><span class="spinner"></span></div><div class="voice-heard">正在理解…</div>`);
 }
 
-// webm/opus 录音 → 解码 → 重采样到 16k 单声道 → 编码为 wav → base64
-async function blobToWav16kBase64(blob) {
-  const buf = await blob.arrayBuffer();
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  const ctx = new Ctx();
-  const audioBuf = await ctx.decodeAudioData(buf);
-  try { ctx.close(); } catch {}
-  const input = audioBuf.getChannelData(0);
-  const ratio = audioBuf.sampleRate / 16000;
+// 一段 float32 音频 → 降采样到 16k → 16bit PCM → base64
+function floatToInt16Base64(input, inRate) {
+  const ratio = inRate / 16000;
   const outLen = Math.max(1, Math.floor(input.length / ratio));
   const out = new Int16Array(outLen);
   for (let i = 0; i < outLen; i++) {
@@ -715,15 +743,7 @@ async function blobToWav16kBase64(blob) {
     s = Math.max(-1, Math.min(1, s));
     out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
-  const ab = new ArrayBuffer(44 + out.length * 2);
-  const v = new DataView(ab);
-  const ws = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
-  ws(0, 'RIFF'); v.setUint32(4, 36 + out.length * 2, true); ws(8, 'WAVE');
-  ws(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-  ws(36, 'data'); v.setUint32(40, out.length * 2, true);
-  for (let i = 0; i < out.length; i++) v.setInt16(44 + i * 2, out[i], true);
-  const bytes = new Uint8Array(ab);
+  const bytes = new Uint8Array(out.buffer);
   let bin = '';
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin);
